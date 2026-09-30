@@ -15,6 +15,163 @@ One FastAPI app serves the API, the React admin SPA, and the telephony webhooks.
 
 ---
 
+## Fresh GCP VM (Debian 12/13) — end to end
+
+Production values: domain **`epp.globalvoxinc.ai`**, helpline number **+91 80 3182 9020**
+(Plivo, Bangalore fixed line → `PLIVO_FROM_NUMBER=+918031829020`). Shape: Compute Engine
+`e2-small` or larger, Debian 13, one static external IP. Total time ~20 minutes, most of it
+waiting on the first Docker build.
+
+### 1. On the GCP side (console or gcloud, once)
+
+```bash
+# Reserve the VM's external IP so DNS never goes stale after a stop/start
+gcloud compute addresses create epp-ip --region=<REGION>
+gcloud compute instances add-access-config epp --zone=<ZONE> --address=$(gcloud compute addresses describe epp-ip --region=<REGION> --format='value(address)')
+# Let the world reach Caddy (80 for the cert challenge, 443 for everything)
+gcloud compute instances add-tags epp --zone=<ZONE> --tags=https-server,http-server
+```
+
+Or in the console: VM → Edit → tick **Allow HTTP traffic** and **Allow HTTPS traffic**;
+VPC network → IP addresses → promote the VM's ephemeral IP to static.
+
+### 2. DNS
+
+In the `globalvoxinc.ai` zone add an **A record** `epp` → the static IP. Wait until
+`nslookup epp.globalvoxinc.ai` returns that IP from your laptop; Caddy cannot get a
+certificate before DNS resolves.
+
+### 3. On the VM
+
+```bash
+# Docker (official script handles Debian 13)
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER && newgrp docker
+
+# Caddy (official repo)
+sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt-get update && sudo apt-get install -y caddy git
+
+# The code. Two mirrors carry the same main: GitHub (used by the server) and Bitbucket.
+git clone https://github.com/addiskers/epp.git ~/epp && cd ~/epp
+
+# Settings
+cp .env.example .env
+nano .env
+```
+
+Set at least these in `.env`:
+
+```
+GEMINI_API_KEY=...                       # a key whose project has spend headroom
+MODEL=gemini-3.1-flash-live-preview
+EPP_ANALYSIS_MODEL=gemini-3.6-flash      # a TEXT model; gemini-3.1-flash does not exist
+PLIVO_AUTH_ID=...
+PLIVO_AUTH_TOKEN=...
+PLIVO_FROM_NUMBER=+918031829020          # the helpline number, E.164
+PUBLIC_URL=https://epp.globalvoxinc.ai
+EPP_ADMIN_USER=admin
+EPP_ADMIN_PASS=<strong password>
+EPP_SESSION_SECRET=<output of: openssl rand -hex 32>
+EPP_COMPANY_NAME=EPP Composites
+EPP_HELPLINE_NAME=EPP Composites Support Helpline
+EPP_TICKET_PREFIX=EPP
+```
+
+Leave `DATA_DIR` blank (compose sets it to the volume). Then:
+
+```bash
+docker compose up -d --build            # first build: 3-5 minutes
+docker compose logs -f                  # wait for "EPP helpline ready … plivo=ready"
+
+sudo tee /etc/caddy/Caddyfile >/dev/null <<'EOF'
+epp.globalvoxinc.ai {
+    reverse_proxy localhost:8000
+}
+EOF
+sudo systemctl reload caddy             # Caddy fetches the certificate itself
+```
+
+### 4. Verify from your laptop, not from the VM
+
+```bash
+curl https://epp.globalvoxinc.ai/healthz
+# {"ok":true,"live_calls":0,"gemini":{"ok":true}}
+curl "https://epp.globalvoxinc.ai/plivo/answer?From=%2B919876543210&CallUUID=x"
+# must start with <?xml … <Stream … wss://epp.globalvoxinc.ai/plivo/media-stream
+```
+
+If the second one is not XML, Plivo cannot reach you either — fix that before touching Plivo.
+
+### 5. Plivo
+
+Voice → Applications → your app: **Answer URL** `https://epp.globalvoxinc.ai/plivo/answer`,
+method **GET**. Assign the app to the helpline number. Ring the number: the log shows
+`INBOUND call … from +91…`, then `Plivo stream started`.
+
+### 6. Sign in
+
+`https://epp.globalvoxinc.ai/admin` with `EPP_ADMIN_USER` / `EPP_ADMIN_PASS`. Change the
+password on Profile, then follow **First run** below.
+
+### 7. The client's domain: `grievance.epp.world`
+
+The client's DNS already has an **A record** `grievance.epp.world` → `34.51.97.171` (the VM's
+static IP; `gcloud compute addresses list` confirms). Serve it next to the old name, so nothing
+breaks while Plivo is switched over. On the VM:
+
+```bash
+sudo tee /etc/caddy/Caddyfile >/dev/null <<'EOF'
+epp.globalvoxinc.ai, grievance.epp.world {
+    reverse_proxy localhost:8000
+}
+EOF
+sudo systemctl reload caddy             # fetches a certificate for grievance.epp.world; both hosts keep working
+curl -s https://grievance.epp.world/healthz   # must print {"ok":true,...} before you go on
+sed -i 's#^PUBLIC_URL=.*#PUBLIC_URL=https://grievance.epp.world#' ~/epp/.env
+cd ~/epp && docker compose up -d
+```
+
+Then in Plivo (Voice → Applications → the helpline app) change the **Answer URL** to
+`https://grievance.epp.world/plivo/answer` and save. Check from your laptop:
+`curl -s https://grievance.epp.world/healthz` and
+`curl -s https://grievance.epp.world/plivo/answer | head -3` (XML whose `<Stream>` says
+`wss://grievance.epp.world/plivo/media-stream`), then ring the number. The client signs in at
+`https://grievance.epp.world/admin`. Keep `epp.globalvoxinc.ai` in the Caddyfile until a few
+real calls have gone through the new name; dropping it later is one line.
+
+### 8. Going live: your account, the client's tabs, a clean slate
+
+1. On Users, create **your own** admin (say `globalvox`), separate from the admin you hand to
+   the client. Put it in `.env`: `EPP_SUPERADMIN_USERS=globalvox`, then `docker compose up -d`.
+2. Sign in as `globalvox`. The menu now has **Super admin**.
+3. **Tabs the client sees**: tick the tabs, Save changes. You still see every tab; the ones the
+   client does not see carry a "hidden" tag in your menu.
+4. **Clear test data before go-live**: tick what to delete (tickets, call logs and recordings,
+   audit log, contacts and campaigns), type `DELETE`, press the button. It refuses while a call
+   is on the line. Users, departments, categories, the agent scripts and the plan stay. New
+   tickets start again at `…-000001` and the Subscription page's minutes go back to 0.
+5. Nothing is thrown away: the database is copied and the call files are moved into
+   `/var/epp-data/backups/before-reset-<date-time>/` first. To undo, stop the app and put
+   `epp.db`, `calls/` and `recordings/` from that folder back into `/var/epp-data/`. Delete old
+   backup folders yourself when you no longer need them.
+
+### Day-2
+
+| Task | Command |
+|---|---|
+| Update to the latest code | `cd ~/epp && git pull && docker compose up -d --build`. The shipped script applies itself on boot when nobody edited it (log: `shipped script updated`, the old text is kept in `agent_versions`). An edited script is left alone and logs `STALE AGENT PROMPT` if it is behind — reset it on the Agent page, which also switches it back to automatic updates. |
+| Hide or show admin pages | Super admin page → Tabs the client sees → Save. `EPP_HIDDEN_PAGES` in `.env` is only the starting list until then. |
+| Set the client's plan | `EPP_PLAN_*` and `EPP_RATE_INR_PER_MIN` in `.env` (or override it on the Subscription page as a user listed in `EPP_SUPERADMIN_USERS`) |
+| Logs | `docker compose logs -f --tail=200` |
+| Restart | `docker compose restart` |
+| Backup | `docker compose exec epp-helpline tar czf - /var/epp-data > epp-backup-$(date +%F).tgz` |
+| Caddy status / cert | `sudo systemctl status caddy` · `sudo journalctl -u caddy -n 50` |
+
+---
+
 ## Docker (recommended)
 
 ```bash
@@ -108,17 +265,23 @@ Re-run `npm run build` after any SPA change — FastAPI serves the built `admin/
 | `EPP_COMPANY_NAME` / `EPP_HELPLINE_NAME` / `EPP_TICKET_PREFIX` | Spoken in the greeting and the ticket number. |
 | `EPP_ENABLED_LANGUAGES` | Switch off any language that fails the live-call check below. |
 | `MAX_LIVE_CALLS` | Simultaneous live calls, inbound **and** campaign together (default 10). Each is a Gemini session plus telephony. |
-| `EPP_CAMPAIGN_*` | Campaign pacing and retries; see `.env.example`. The Scheduler page's ON/OFF switch is the fastest way to stop all outbound dialing. |
+| `EPP_CAMPAIGN_*` | Campaign pacing and retries; see `.env.example`. The Scheduler page's ON/OFF switch is the fastest way to stop all outbound dialing (it survives restarts). |
+| `EPP_HIDDEN_PAGES` | Starting list of admin pages hidden from the client. Default `campaigns,contacts,scheduler`; blank shows everything. The Super admin page overrides it once saved. |
+| `EPP_PLAN_NAME` / `EPP_PLAN_MINUTES` / `EPP_PLAN_START` / `EPP_PLAN_END` / `EPP_LICENCE_VALID_TILL` / `EPP_RATE_INR_PER_MIN` | The Subscription page: what the client bought. Minutes count per phone call rounded up, inside the period (IST dates). |
+| `EPP_SUPERADMIN_USERS` | Your own admin login(s): they get the Super admin page (client tabs, go-live data reset) and can edit the plan. Never the account the client uses. Blank = nobody. |
 | `DATA_DIR` | Leave blank under compose — it sets `/var/epp-data` (the persistent volume). |
 
 ---
 
 ## Language verification checklist
 
-Gemini Live fixes the speech language code per session (`en-IN`); the script drives the
-switch to the caller's language. Hindi and Gujarati are proven on this stack. The rest must be
-verified on a real phone call before they are promised to callers. Record the result here and
-remove any failure from `EPP_ENABLED_LANGUAGES`.
+**Before the checklist:** the Accent field on the Agent page must be **blank**, and
+`EO_SPEECH_LANGUAGE_CODE` blank in `.env`. The boot log then shows `language=auto-detect`.
+Pinning `en-IN` biased the model toward Hindi/English (a Gujarati caller was answered in
+Hindi on the first test round). The script drives the switch to the caller's language. Hindi
+and English are proven on this stack. The rest must be verified on a real phone call before
+they are promised to callers. Record the result here and remove any failure from
+`EPP_ENABLED_LANGUAGES`.
 
 | Language | Understood the caller | Spoke back naturally | Read the ticket number correctly | Verified by / date |
 |---|---|---|---|---|
@@ -183,6 +346,13 @@ docker compose exec epp-helpline tar czf - /var/epp-data > epp-backup-$(date +%F
 
 ## Troubleshooting
 
+**Agent answers "our systems are down, call back later" on every call** — the call reached
+the app without its context. The log shows `prompt_chars=374` (the fallback prompt; the real
+script is ~11,000) and, just before it, `INBOUND call - to/from unknown` or an ERROR about a
+missing CallUUID. Cause: the answer webhook did not get Plivo's parameters. Update to a build
+that reads both the query string and the POST form body (Sept 2026 or later); until then set
+the Plivo application's Answer method to **GET**.
+
 **`plivo=NOT configured`** — `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN` or `PLIVO_FROM_NUMBER` is unset.
 
 **Calls connect but there's silence** — the answer webhook must be reachable *from the
@@ -209,6 +379,18 @@ which, in an amber banner.
 
 **The agent hung up while the caller was writing the number down** — raise
 `EO_POST_RSVP_IDLE_SECONDS` (default 20).
+
+**A department name is misspelled ("Maintainance")** — it was typed on the server; the code
+ships "Maintenance" and seeding never renames a row. Boot logs `did you mean 'Maintenance'?`
+naming the row; fix it on Departments & Routing (edit the name box, Save changes). To look
+first: `docker compose exec epp-helpline sqlite3 /var/epp-data/epp.db "select id,name,code from departments"`.
+
+**The phone still says the old greeting after a deploy** — the boot log tells you which case
+you are in. `shipped script updated` / `shipped script applied`: fixed, the next call has the
+new text. `customised script kept as is`: someone edited the script before this build, so it is
+frozen — open the Agent page and click Reset to shipped script (your edits are in
+`agent_versions`, reason `reset`). `STALE AGENT PROMPT`: an edited script is missing a fix; same
+remedy.
 
 **A campaign is live but nobody is being called** — in order: the Scheduler switch is OFF;
 it is outside the campaign's calling hours; `MAX_LIVE_CALLS` is used up by inbound calls;

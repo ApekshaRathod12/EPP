@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, qs, fmtDate, minToHHMM, CAMPAIGN_TYPE_LABEL } from '../api.js'
+import { refreshingStyle, useDebounced } from '../hooks.js'
+import InlineLoader from '../components/Loading.jsx'
 import PageHeader from '../components/PageHeader.jsx'
 import { IconSearch } from '../components/icons.jsx'
 
@@ -17,7 +19,8 @@ export default function Campaigns() {
   const [page, setPage] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
 
-  const filters = useMemo(() => ({ q, status, limit: PAGE, offset: page * PAGE }), [q, status, page])
+  const dq = useDebounced(q, 300)
+  const filters = useMemo(() => ({ q: dq, status, limit: PAGE, offset: page * PAGE }), [dq, status, page])
   useEffect(() => {
     let cancel = false
     setLoading(true)
@@ -42,13 +45,14 @@ export default function Campaigns() {
         <div className="toolbar">
           <div className="search"><span className="ic"><IconSearch /></span>
             <input placeholder="Search campaigns…" value={q} onChange={(e) => { setPage(0); setQ(e.target.value) }} /></div>
+          <InlineLoader show={loading} label="Searching…" />
           <select value={status} onChange={(e) => { setPage(0); setStatus(e.target.value) }}>
             <option value="">All statuses</option>
             {['scheduled', 'live', 'completed', 'cancelled'].map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
         {err && <div className="err">{err}</div>}
-        <div className="table-wrap">
+        <div className="table-wrap tall" style={refreshingStyle(loading)}>
           <table>
             <thead><tr>
               <th className="no-sort">Campaign</th><th className="no-sort">Type</th><th className="no-sort">Status</th>
@@ -56,7 +60,7 @@ export default function Campaigns() {
               <th className="no-sort">Calling hours</th><th className="no-sort">Retries</th><th className="no-sort"></th>
             </tr></thead>
             <tbody>
-              {loading ? <tr><td colSpan={9} className="empty">Loading…</td></tr>
+              {loading && !items.length ? <tr><td colSpan={9} className="empty">Loading…</td></tr>
                 : !items.length ? <tr><td colSpan={9} className="empty">No campaigns yet.</td></tr>
                 : items.map((c) => {
                   const p = c.progress || {}

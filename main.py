@@ -43,14 +43,16 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from gemini_live import GeminiLive
 from hallucination_guard import HallucinationGuard
-from plivo_handler import PlivoMediaBridge
+from plivo_handler import ListenMixer, PlivoMediaBridge
 
 import agent_tools
+import audit
 import campaign_runner
 import campaigns
 import eo_api
 import eo_auth
 import eo_db
+import known_caller
 import languages
 import prompt_render
 import store
@@ -81,6 +83,9 @@ def tool_mapping(recorder: CallRecorder, outbound=False):
     mapping = {
         "create_ticket": lambda **kw: tickets.create_from_tool(kw, recorder.call_meta),
         "lookup_ticket": lambda **kw: tickets.lookup(kw.get("ticket_number")),
+        # may only touch tickets create_ticket returned on THIS call (the recorder keeps the list)
+        "update_ticket": lambda **kw: tickets.update_from_tool(
+            kw, recorder.call_meta, list((recorder.call or {}).get("ticket_ids") or [])),
         "end_call": handle_end_call,
     }
     if outbound:
@@ -128,7 +133,8 @@ def _resolve_call_context(caller="", agent_id=None):
 
     NEVER raises: on any failure it falls back to an identity-free prompt so the call still
     connects and the caller hears an apology instead of silence."""
-    ctx = {"agent": None, "system_instruction": None, "trigger": "", "tools": None, "missing": []}
+    ctx = {"agent": None, "system_instruction": None, "trigger": "", "tools": None, "missing": [],
+           "known_caller": None}
     try:
         st = _static_context()
         agent = eo_db.get_agent(agent_id) if agent_id else None
@@ -136,9 +142,17 @@ def _resolve_call_context(caller="", agent_id=None):
             logger.warning("Call context: agent %r not found; using the intake agent", agent_id)
         agent = agent or st["agent"]
         ctx["agent"] = agent
+        # A returning caller is greeted by name in their language and not re-interrogated.
+        profile = known_caller.lookup(caller) if caller else None
+        ctx["known_caller"] = profile
+        if profile:
+            logger.info("Known caller %s: %s (%s), %d open ticket(s), language=%s", caller,
+                        profile["name"], profile.get("caller_type") or "?", len(profile["open_tickets"]),
+                        profile.get("language") or "-")
         rendered = prompt_render.render_prompt(
             agent, caller_phone=caller, categories=st["categories"],
-            departments=st["departments"], langs=st["langs"])
+            departments=st["departments"], langs=st["langs"],
+            extra=known_caller.placeholders(profile), known=profile is not None)
         ctx["system_instruction"] = rendered["system_instruction"]
         ctx["trigger"] = rendered["trigger"]
         ctx["missing"] = rendered["missing"]
@@ -171,11 +185,18 @@ def _resolve_ws_test_context(websocket):
 # Live transcript watchers (the dashboard's live panel) and the calls currently connected.
 live_watchers: set = set()
 _active_calls: dict = {}
+# call_sid -> the PlivoMediaBridge carrying it, so an admin can listen in (kept in lockstep
+# with _active_calls: registered at call_start, dropped at call_end and when the bridge exits).
+_bridges: dict = {}
 
 
 def active_calls():
     """The calls connected right now, for the dashboard."""
     return [dict(v, call_sid=k) for k, v in _active_calls.items()]
+
+
+def live_bridge(call_sid: str):
+    return _bridges.get(call_sid or "")
 
 
 # Global cap on simultaneous live calls — inbound helpline calls AND campaign dials share it,
@@ -193,6 +214,30 @@ MAX_LIVE_CALLS = _max_live_calls()
 def live_room() -> int:
     """How many more calls may start right now (>= 0)."""
     return max(0, MAX_LIVE_CALLS - len(_active_calls))
+
+
+def audit_call_outcome(call):
+    """One audit row for a phone call that ended WITHOUT a ticket, so the audit log answers
+    "ticket created / not created" for every call (the created ones are logged by tickets.py).
+    Browser tests are skipped. Never raises."""
+    try:
+        call = call or {}
+        if not call.get("id") or call.get("source") == "browser":
+            return
+        if call.get("ticket_id") or call.get("ticket_ids"):
+            return
+        if call.get("lookup_ticket_ids"):
+            reason = "status_inquiry"
+        elif call.get("outcome"):
+            reason = f"outcome:{call['outcome']}"
+        else:
+            reason = "no_ticket"
+        audit.log("call_no_ticket", user=audit.AGENT, target=f"call:{call['id']}",
+                  detail={"phone": call.get("caller") or "", "reason": reason,
+                          "duration_seconds": int(call.get("duration_seconds") or 0),
+                          "source": call.get("source") or ""})
+    except Exception:
+        logger.debug("call_no_ticket audit failed", exc_info=True)
 
 
 # The last time the voice model refused or dropped a session (spending cap, bad key, quota).
@@ -268,12 +313,12 @@ async def _prewarm_gemini(call_uuid: str, ctx=None):
 
 
 def _remember_call_meta(call_uuid, caller, direction="", trigger="", context=None,
-                        campaign_id=None, campaign_contact_id=None):
+                        campaign_id=None, campaign_contact_id=None, caller_name=""):
     if not call_uuid:
         return
     _pending_call_meta[call_uuid] = {
-        "caller": caller or "", "direction": direction or "", "trigger": trigger or "",
-        "ctx": context or {}, "answered_at": time.monotonic(),
+        "caller": caller or "", "caller_name": caller_name or "", "direction": direction or "",
+        "trigger": trigger or "", "ctx": context or {}, "answered_at": time.monotonic(),
         "campaign_id": campaign_id, "campaign_contact_id": campaign_contact_id,
     }
     if len(_pending_call_meta) > 200:
@@ -311,6 +356,11 @@ async def _lifespan(app: FastAPI):
         eo_auth.seed_admin()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
+    try:
+        await store.backfill_caller_names(
+            lambda cid: next((t.get("caller_name") for t in eo_db.tickets_by_call(cid) if t.get("caller_name")), ""))
+    except Exception as e:
+        logger.warning(f"caller_name backfill skipped: {e}")
     logger.info("EPP helpline ready: model=%s languages=%s plivo=%s public_url=%s",
                 MODEL, ",".join(languages.enabled_codes()),
                 "ready" if os.getenv("PLIVO_AUTH_ID") and os.getenv("PLIVO_FROM_NUMBER") else "NOT configured",
@@ -561,10 +611,23 @@ async def plivo_answer(request: Request):
         secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "") == "https"
     ws_url = f"{'wss' if secure else 'ws'}://{host}/plivo/media-stream"
 
-    qp = request.query_params
+    # Plivo sends the call parameters (From, CallUUID, Direction…) in the query string on a
+    # GET application and in the form body on a POST one — the console defaults to POST.
+    # Read both; the query string wins because the parameters WE put on an outbound answer
+    # URL (?caller=, ?campaign=, ?cc=) must never be shadowed by Plivo's own fields.
+    qp = dict(request.query_params)
+    if request.method == "POST":
+        try:
+            for key, value in (await request.form()).items():
+                qp.setdefault(key, str(value))
+        except Exception as e:
+            logger.warning("/plivo/answer: could not read the form body (%s)", e)
     # ?caller= exists only on answer URLs WE built for outbound dials (a test call, or a
     # campaign dial carrying ?campaign=&cc=); a genuine inbound call carries the number in `From`.
-    caller = qp.get("caller") or qp.get("From") or qp.get("from") or ""
+    # Plivo's From arrives as "919876543210" (no plus); store and speak it as E.164 like every
+    # other number in the system, so call records and the known-caller match line up.
+    raw_from = qp.get("From") or qp.get("from") or ""
+    caller = qp.get("caller") or (tickets._clean_phone(raw_from) or raw_from)
     call_uuid = qp.get("CallUUID") or qp.get("callUUID") or qp.get("RequestUUID") or ""
     campaign_id = cc_id = None
     try:
@@ -583,11 +646,19 @@ async def plivo_answer(request: Request):
     if call_ctx.get("missing"):
         logger.warning("Call %s: prompt has unresolved placeholders %s", call_uuid or "-", call_ctx["missing"])
 
+    known_name = (call_ctx.get("known_caller") or {}).get("name") or call_ctx.get("caller_name") or ""
     _remember_call_meta(call_uuid, caller, direction=direction, trigger=call_ctx.get("trigger") or "",
-                        context=call_ctx, campaign_id=campaign_id, campaign_contact_id=cc_id)
-    if call_uuid and GEMINI_API_KEY:
+                        context=call_ctx, campaign_id=campaign_id, campaign_contact_id=cc_id,
+                        caller_name=known_name)
+    if call_uuid:
+        # The media stream finds THIS call's context by this id; without it the session
+        # falls back to the identity-free "systems are down" prompt.
         ws_url += f"?call={quote(call_uuid)}"
-        asyncio.create_task(_prewarm_gemini(call_uuid, call_ctx))
+        if GEMINI_API_KEY:
+            asyncio.create_task(_prewarm_gemini(call_uuid, call_ctx))
+    else:
+        logger.error("/plivo/answer: no CallUUID in the request — the media stream will connect "
+                     "WITHOUT the helpline script. Check the Plivo application's answer method/URL.")
     eh_attr = f' extraHeaders="X-Caller={quote(caller)}"' if caller else ""
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -633,17 +704,24 @@ async def plivo_media_stream(websocket: WebSocket):
             caller = m.get("caller") or event.get("caller") or ""
             await recorder.open(source=source, call_sid=event.get("call_sid") or None, caller=caller,
                                 campaign_id=m.get("campaign_id") or meta.get("campaign_id"),
-                                campaign_contact_id=m.get("campaign_contact_id") or meta.get("campaign_contact_id"))
+                                campaign_contact_id=m.get("campaign_contact_id") or meta.get("campaign_contact_id"),
+                                caller_name=m.get("caller_name") or meta.get("caller_name") or "")
             sid = event.get("call_sid") or ""
             if sid:
                 _active_calls[sid] = {"caller": caller, "started_at": time.time(),
+                                      "caller_name": (recorder.call or {}).get("caller_name") or "",
                                       "call_id": (recorder.call or {}).get("id"), "source": source}
-            event = dict(event, call_id=(recorder.call or {}).get("id"), caller=caller, source=source)
+                _bridges[sid] = bridge
+            event = dict(event, call_id=(recorder.call or {}).get("id"), caller=caller, source=source,
+                         caller_name=(recorder.call or {}).get("caller_name") or "")
         elif etype == "call_end":
-            _active_calls.pop(event.get("call_sid") or recorder.call_meta.get("call_sid") or "", None)
+            ended_sid = event.get("call_sid") or recorder.call_meta.get("call_sid") or ""
+            _active_calls.pop(ended_sid, None)
+            _bridges.pop(ended_sid, None)
             await recorder.close()
             event = dict(event, call_id=(recorder.call or {}).get("id"),
                          ticket_id=(recorder.call or {}).get("ticket_id"))
+            audit_call_outcome(recorder.call)
         else:
             await recorder.on_event(event)
             if etype == "error":
@@ -677,6 +755,7 @@ async def plivo_media_stream(websocket: WebSocket):
         logger.error(f"Plivo bridge error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
     finally:
         _active_calls.pop(bridge.call_id or "", None)
+        _bridges.pop(bridge.call_id or "", None)
         try:
             await websocket.close()
         except Exception:
@@ -704,6 +783,70 @@ async def live_ws(websocket: WebSocket):
     finally:
         live_watchers.discard(websocket)
         logger.info(f"Live watcher disconnected ({len(live_watchers)} total)")
+
+
+@app.websocket("/live/listen/{call_sid}")
+async def live_listen(websocket: WebSocket, call_sid: str):
+    """An admin listens in on one live call: both sides mixed to mono PCM16 8 kHz, one binary
+    frame per 20 ms, after a JSON `listen_start`. Listen-only — nothing reaches the caller.
+    The socket is accepted before a refusal so the browser sees the close code."""
+    token = websocket.query_params.get("token") or ""
+    claims = eo_auth.verify_live_token(token)
+    user = eo_db.get_user(int(claims["uid"])) if claims and claims.get("uid") is not None else None
+    await websocket.accept()
+    if not user or not user.get("active") or user.get("role") != "admin":
+        await websocket.close(code=4401)
+        return
+    bridge = live_bridge(call_sid)
+    if bridge is None:
+        await websocket.close(code=4404)
+        return
+    q = bridge.add_listener()
+    if q is None:
+        await websocket.close(code=4429)
+        return
+    meta = _active_calls.get(call_sid) or {}
+    audit.log("call_listened", user=user, target=f"call:{meta.get('call_id') or call_sid}",
+              detail={"call_sid": call_sid, "phone": meta.get("caller") or ""})
+    logger.info("Listen: %s is listening to call %s", user.get("username"), call_sid)
+    mixer = ListenMixer()
+    recv_task = asyncio.create_task(websocket.receive())
+    get_task = None
+    try:
+        await websocket.send_json({"type": "listen_start", "call_sid": call_sid, "rate": 8000, "format": "pcm16"})
+        while True:
+            if get_task is None:
+                get_task = asyncio.create_task(q.get())
+            done, _ = await asyncio.wait({get_task, recv_task}, return_when=asyncio.FIRST_COMPLETED)
+            if recv_task in done:
+                msg = recv_task.result() if not recv_task.cancelled() and recv_task.exception() is None else None
+                if not msg or msg.get("type") == "websocket.disconnect":
+                    break                                   # the listener left
+                recv_task = asyncio.create_task(websocket.receive())
+                continue
+            item = get_task.result()
+            get_task = None
+            if item is None:
+                break                                       # the call ended
+            out = mixer.push(*item)
+            if out:
+                await websocket.send_bytes(out)
+    except Exception:
+        pass
+    finally:
+        for t in (get_task, recv_task):
+            if t is not None and not t.done():
+                t.cancel()
+        bridge.remove_listener(q)
+        try:
+            await websocket.send_json({"type": "listen_end"})
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        logger.info("Listen: %s stopped listening to call %s", user.get("username"), call_sid)
 
 
 if __name__ == "__main__":

@@ -80,17 +80,21 @@ all outbound dialing at once.
 |---|---|
 | Dashboard | Open / high-priority / today tiles, breakdowns by status, department, caller type, priority, last 7 days, escalated list, live calls with a rolling transcript |
 | Tickets | Search and filter (status, priority, department, caller type, escalated, date), CSV export |
-| Ticket | Caller card, the concern, AI summary + sentiment + flags, transcript and recording, timeline, status / assignment / priority / notes / reclassify |
+| Ticket | Caller card, the concern, AI summary + caller mood + flags, transcript and recording, timeline; ONE "Save changes" for category / department / assignee / priority / status (+ a note), applied all-or-nothing |
 | Campaigns | Create (type → recipients → message → schedule), list, detail with per-recipient status, outcome, Call now, cancel |
 | Contacts | The pool a campaign calls: xlsx/csv upload with a sample, add one, search, delete |
-| Scheduler | Kill switch for all outbound dialing, and the retry queue |
-| Routing | Departments, and the category → department mapping per caller type (with high-priority flag and keywords) |
-| Agent | The intake script (placeholders, voice), preview, browser-mic test, "Call me" test |
-| Call logs | Every call with transcript, recording, analysis and linked tickets |
-| Users | Admins and department users |
-| Audit log | Logins, config changes, ticket updates, every transcript / recording view |
+| Scheduler | Kill switch for all outbound dialing (survives restarts), and the retry queue |
+| Departments & Routing | Departments (name, code, active), and the category → department mapping per caller type (high-priority flag, keywords); each table has its own Save |
+| Agent | The intake script (placeholders, voice), preview, browser-mic test, "Call me" test; a Shipped / Customised badge says whether deploys update it automatically |
+| Call logs | Every call with the caller's name, transcript, recording, analysis and linked tickets |
+| Users | Admins and department users; Edit opens a form with Save |
+| Audit log | Logins, config changes, ticket updates, every transcript / recording view, plus one row per call: `ticket_created` or `call_no_ticket` (with the reason) |
+| Subscription | Minutes purchased vs used (per phone call, rounded up), ₹ at the configured rate, plan period and licence; editable only by `EPP_SUPERADMIN_USERS` |
+| Super admin | Only for `EPP_SUPERADMIN_USERS` (the service provider): tick which tabs the client's admins see, and clear the test data before go-live (tickets, call logs + recordings, audit log, contacts + campaigns — backed up first) |
 
-Roles: **admin** sees everything; **dept_user** sees only tickets assigned to their department.
+Roles: **admin** sees everything the super admin left on the menu; **dept_user** sees only tickets
+assigned to their department. The super admin always sees every tab, with the hidden ones tagged.
+`EPP_HIDDEN_PAGES` is only the starting list (default: the three outbound pages).
 
 ## Customising
 
@@ -100,7 +104,9 @@ Roles: **admin** sees everything; **dept_user** sees only tickets assigned to th
 | The follow-up and announcement scripts, and the outbound opening | Agent page — three agents; each has an inbound and an outbound opening |
 | Campaign pacing, calling hours, retries | `.env` (`EPP_CAMPAIGN_*`, `MAX_LIVE_CALLS`) and per campaign at creation |
 | Company / helpline name, ticket prefix, enabled languages | `.env` (`EPP_*`) |
-| Department mapping, high-priority categories, keywords | Routing page (`epp_seeds.py` seeds the first run) |
+| Department mapping, high-priority categories, keywords | Departments & Routing page (`epp_seeds.py` seeds the first run) |
+| Which admin pages the client sees | `.env` (`EPP_HIDDEN_PAGES`) |
+| The client's plan (minutes, dates, ₹ rate) | `.env` (`EPP_PLAN_*`, `EPP_RATE_INR_PER_MIN`) or the Subscription page as an `EPP_SUPERADMIN_USERS` user |
 | Priority keyword net | `routing.py` |
 | Voice / accent | Agent page, or `EO_VOICE_NAME` / `EO_SPEECH_LANGUAGE_CODE` |
 | Post-call analysis model | `EPP_ANALYSIS_MODEL` |
@@ -115,6 +121,9 @@ Roles: **admin** sees everything; **dept_user** sees only tickets assigned to th
 | `GET/POST /plivo/answer`, `WS /plivo/media-stream` | Plivo telephony bridge |
 | `WS /ws` | Browser-mic test (short-lived token from the Agent page) |
 | `WS /live/ws` | Live transcript feed for the dashboard (short-lived token) |
+| `WS /live/listen/{call_sid}` | Listen in on one live call: both sides as mono PCM16 8 kHz frames (admin, short-lived token; audited as `call_listened`) |
+| `GET/PUT /api/epp/subscription` | The plan and its usage (PUT: superadmins only) |
+| `GET /api/epp/superadmin`, `PUT …/superadmin/pages`, `POST …/superadmin/reset-data` | Super admin: the client's tabs, and the go-live data reset (superadmins only) |
 | `GET /healthz` | Liveness |
 
 ## Project structure

@@ -1,9 +1,21 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, fmtDate, qs } from '../api.js'
+import { refreshingStyle, useDebounced } from '../hooks.js'
+import InlineLoader from '../components/Loading.jsx'
 import PageHeader from '../components/PageHeader.jsx'
 import { IconSearch } from '../components/icons.jsx'
 
 const PAGE = 50
+
+// Colour by what the row means: red = something failed, green = a ticket was registered on a
+// call, blue = a call ended without one, amber = someone viewed a transcript or recording.
+function pillClass(action) {
+  if (action === 'ticket_created' || action === 'ticket_created_manual') return 'green'
+  if (action === 'call_no_ticket' || action === 'call_listened') return 'blue'
+  if (action.includes('failed')) return 'red'
+  if (action.includes('viewed') || action.includes('played')) return 'amber'
+  return 'src'
+}
 
 export default function AuditLog() {
   const [items, setItems] = useState([])
@@ -11,15 +23,19 @@ export default function AuditLog() {
   const [actions, setActions] = useState([])
   const [err, setErr] = useState('')
   const [q, setQ] = useState('')
+  const [loading, setLoading] = useState(false)
   const [action, setAction] = useState('')
   const [from, setFrom] = useState('')
   const [to, setTo] = useState('')
   const [page, setPage] = useState(0)
 
   useEffect(() => { api.get('/audit/actions').then((d) => setActions(d.items || [])).catch(() => {}) }, [])
-  const filters = useMemo(() => ({ q, action, from, to, limit: PAGE, offset: page * PAGE }), [q, action, from, to, page])
+  const dq = useDebounced(q, 300)
+  const filters = useMemo(() => ({ q: dq, action, from, to, limit: PAGE, offset: page * PAGE }), [dq, action, from, to, page])
   useEffect(() => {
+    setLoading(true)
     api.get(`/audit${qs(filters)}`).then((d) => { setItems(d.items || []); setTotal(d.total || 0) }).catch((e) => setErr(e.message))
+      .finally(() => setLoading(false))
   }, [filters])
 
   return (
@@ -34,9 +50,10 @@ export default function AuditLog() {
         </select>
         <input type="date" value={from} onChange={(e) => { setPage(0); setFrom(e.target.value) }} />
         <input type="date" value={to} onChange={(e) => { setPage(0); setTo(e.target.value) }} />
+        <InlineLoader show={loading} label="Searching…" />
       </div>
       {err && <div className="err">{err}</div>}
-      <div className="table-wrap">
+      <div className="table-wrap tall" style={refreshingStyle(loading)}>
         <table>
           <thead><tr><th className="no-sort">When</th><th className="no-sort">User</th><th className="no-sort">Action</th><th className="no-sort">Target</th><th className="no-sort">Detail</th><th className="no-sort">IP</th></tr></thead>
           <tbody>
@@ -44,7 +61,7 @@ export default function AuditLog() {
               <tr key={a.id}>
                 <td>{fmtDate(a.created_at)}</td>
                 <td>{a.username || <span className="muted">—</span>}</td>
-                <td><span className={`pill ${a.action.includes('failed') ? 'red' : a.action.includes('viewed') || a.action.includes('played') ? 'amber' : 'src'}`}>{a.action}</span></td>
+                <td><span className={`pill ${pillClass(a.action)}`}>{a.action}</span></td>
                 <td style={{ fontFamily: 'var(--mono)', fontSize: '0.78rem' }}>{a.target || '—'}</td>
                 <td className="muted" style={{ fontSize: '0.76rem', maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={a.detail}>{a.detail || '—'}</td>
                 <td className="muted" style={{ fontSize: '0.76rem' }}>{a.ip || '—'}</td>

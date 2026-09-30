@@ -106,12 +106,78 @@ async def init():
     await _run(_init_sync)
 
 
+def _backfill_names_sync(name_for_call):
+    """Records from before `caller_name` existed get it from their ticket, once. A record is
+    touched only when the key is missing altogether, so this is a no-op after the first boot."""
+    with _LOCK:
+        todo = [m["id"] for m in _INDEX.values() if "caller_name" not in m]
+    done = 0
+    for call_id in todo:
+        call = _load_sync(call_id)
+        if not call:
+            continue
+        name = ""
+        if call.get("ticket_id"):
+            try:
+                name = str(name_for_call(call_id) or "").strip()
+            except Exception:
+                name = ""
+        call["caller_name"] = name
+        try:
+            _save_sync(call)
+            done += 1
+        except Exception as e:
+            logger.warning(f"caller_name backfill: could not save {call_id}: {e}")
+    if done:
+        logger.info(f"Call store: caller_name filled in on {done} older call record(s)")
+    return done
+
+
+async def backfill_caller_names(name_for_call):
+    """`name_for_call(call_id) -> str` (the ticket's caller name). Runs once per boot."""
+    return await _run(_backfill_names_sync, name_for_call)
+
+
 async def save_call(call):
     await _run(_save_sync, call)
 
 
 async def load_call(call_id):
     return await _run(_load_sync, call_id)
+
+
+def call_metas():
+    """A snapshot of every call's lightweight record (sync; the index lives in memory)."""
+    with _LOCK:
+        return [dict(m) for m in _INDEX.values()]
+
+
+def recording_count() -> int:
+    try:
+        return sum(1 for n in os.listdir(RECORDINGS_DIR) if n.endswith(".wav"))
+    except FileNotFoundError:
+        return 0
+
+
+def _archive_sync(dest_dir):
+    """Move every call record and recording into dest_dir (a go-live reset keeps them as a
+    backup instead of deleting them), leave empty folders behind, and empty the index."""
+    import shutil
+    moved = {"calls": 0, "recordings": 0}
+    os.makedirs(dest_dir, exist_ok=True)
+    for key, src in (("calls", CALLS_DIR), ("recordings", RECORDINGS_DIR)):
+        if os.path.isdir(src):
+            moved[key] = sum(1 for n in os.listdir(src) if not n.endswith(".tmp"))
+            shutil.move(src, os.path.join(dest_dir, key))
+        os.makedirs(src, exist_ok=True)
+    with _LOCK:
+        _INDEX.clear()
+    logger.warning(f"Call store archived to {dest_dir}: {moved['calls']} call(s), {moved['recordings']} recording(s)")
+    return moved
+
+
+async def archive_calls(dest_dir):
+    return await _run(_archive_sync, dest_dir)
 
 
 def _date_of(meta):
@@ -146,7 +212,7 @@ def _matches(meta, filters):
     q = (filters.get("q") or "").strip().lower()
     if q:
         hay = " ".join(str(meta.get(k, "")) for k in
-                       ("caller", "call_sid", "language", "status", "source", "ticket_id")).lower()
+                       ("caller", "caller_name", "call_sid", "language", "status", "source", "ticket_id")).lower()
         if q not in hay:
             # digit-normalized phone match: "98240 18000" / "98240-18000" still hits +919824018000
             q_digits = re.sub(r"\D", "", q)

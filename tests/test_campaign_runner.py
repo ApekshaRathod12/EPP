@@ -293,6 +293,20 @@ def test_kill_switch_and_shared_cap(monkeypatch):
     assert campaigns.max_active() == campaign_runner._max_active_campaigns() == 4
 
 
+def test_kill_switch_survives_a_restart(fresh_eo_db, monkeypatch):
+    """The admin's OFF used to be a module global: `docker compose restart` silently turned
+    dialing back on. It now lives in the settings table."""
+    db = fresh_eo_db
+    db.init()
+    monkeypatch.setenv("EPP_CAMPAIGN_RUNNER_ENABLED", "true")
+    campaign_runner.set_override(False, by="admin")
+    assert db.get_setting("scheduler_enabled") is False
+    assert db.all_settings()["scheduler_enabled"]["updated_by"] == "admin"
+    assert campaign_runner.is_enabled() is False          # a fresh process reads the same row
+    campaign_runner.set_override(None)
+    assert db.get_setting("scheduler_enabled") is None and campaign_runner.is_enabled() is True
+
+
 def test_tick_does_nothing_when_disabled(fresh_eo_db, monkeypatch):
     db = fresh_eo_db
     db.init()
@@ -301,3 +315,17 @@ def test_tick_does_nothing_when_disabled(fresh_eo_db, monkeypatch):
     asyncio.run(campaign_runner._tick())
     assert db.get_campaign(cid)["status"] == "scheduled"
     campaign_runner.set_override(None)
+
+
+def test_reap_a_ticket_beats_a_recorded_no_concern_and_links_the_row(monkeypatch):
+    """The agent recorded no_concern AND a ticket was created on the call (by the agent or the
+    post-call pass). The ticket is the truth: the row must say ticket_created and carry the id."""
+    rec = {"id": "c9", "ended_at": "x", "outcome": "no_concern", "ticket_id": "EPP-2026-000006", "outcome_note": ""}
+    calls = _run_reap(monkeypatch, rec, _cc())
+    assert len(calls) == 1
+    fields = calls[0][1]
+    assert fields["call_status"] == "done" and fields["outcome"] == "ticket_created"
+    assert fields["ticket_id"] == "EPP-2026-000006"
+    # a follow-up row already carries its ticket id — never overwrite it
+    calls = _run_reap(monkeypatch, rec, _cc(ticket_id="EPP-2026-000001"))
+    assert "ticket_id" not in calls[0][1]

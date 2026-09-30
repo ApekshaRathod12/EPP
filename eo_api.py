@@ -28,8 +28,10 @@ import eo_auth
 import eo_db
 import languages
 import prompt_render
+import data_reset
 import routing
 import store
+import subscription
 import tickets
 
 logger = logging.getLogger(__name__)
@@ -91,6 +93,38 @@ def _user_public(user):
             "department_name": (dep or {}).get("name")}
 
 
+# Admin pages that can be taken off the client's menu. The super admin picks them on the Super
+# admin page (stored in settings["hidden_pages"]); until then EPP_HIDDEN_PAGES decides (a
+# comma-separated list of these keys; blank = show everything). The super admin always sees
+# every page, with the hidden ones marked. The routes stay wired either way.
+UI_PAGES = ("campaigns", "contacts", "scheduler", "routing", "agents", "call-logs", "users", "audit",
+            "subscription")
+_DEFAULT_HIDDEN_PAGES = "campaigns,contacts,scheduler"
+
+
+def client_hidden_pages() -> tuple:
+    """(hidden page keys for the client's admins, 'db' | 'env')."""
+    try:
+        stored = eo_db.get_setting("hidden_pages")
+    except Exception:
+        stored = None
+    if isinstance(stored, list):
+        wanted = {str(p).strip().lower() for p in stored}
+        return [p for p in UI_PAGES if p in wanted], "db"
+    raw = os.getenv("EPP_HIDDEN_PAGES")
+    if raw is None:
+        raw = _DEFAULT_HIDDEN_PAGES
+    wanted = {p.strip().lower() for p in raw.split(",") if p.strip()}
+    return [p for p in UI_PAGES if p in wanted], "env"
+
+
+def ui_config(user=None) -> dict:
+    hidden, _source = client_hidden_pages()
+    superadmin = eo_auth.is_superadmin(user)
+    return {"hidden_pages": [] if superadmin else hidden, "client_hidden_pages": hidden,
+            "superadmin": superadmin}
+
+
 # ---------------------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------------------
@@ -103,7 +137,7 @@ async def login(request: Request):
         audit.log("login_failed", user={"username": username}, request=request)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     audit.log("login", user=user, request=request)
-    return {"ok": True, "token": eo_auth.issue_token(user), "user": _user_public(user)}
+    return {"ok": True, "token": eo_auth.issue_token(user), "user": _user_public(user), "ui": ui_config(user)}
 
 
 @router.post("/logout")
@@ -119,7 +153,7 @@ async def logout(request: Request):
 @router.get("/me")
 async def me(request: Request):
     user = eo_auth.require_user(request)
-    return {"ok": True, "user": _user_public(user)}
+    return {"ok": True, "user": _user_public(user), "ui": ui_config(user)}
 
 
 @router.post("/me/password")
@@ -173,37 +207,56 @@ async def users_create(request: Request):
 
 @router.patch("/users/{user_id}")
 async def users_update(user_id: int, request: Request):
+    """Edit a user (the Users page's Save). Every field is checked before any is written, so a
+    bad department never leaves a half-applied role or status behind."""
     admin = eo_auth.require_admin(request)
-    if not eo_db.get_user(user_id):
+    target = eo_db.get_user(user_id)
+    if not target:
         raise HTTPException(status_code=404, detail="User not found")
     body = await _body(request)
     changes = {}
+    if "name" in body:
+        changes["name"] = _clean_str(body, "name", max_len=120)
     if "active" in body:
         if int(user_id) == int(admin["id"]) and not body["active"]:
             raise HTTPException(status_code=400, detail="You cannot disable your own account")
-        eo_db.set_user_active(int(user_id), bool(body["active"]))
         changes["active"] = bool(body["active"])
+    role = target["role"]
     if "role" in body:
         if body["role"] not in eo_db.ROLES:
             raise HTTPException(status_code=400, detail="Role must be admin or dept_user")
         if int(user_id) == int(admin["id"]) and body["role"] != "admin":
             raise HTTPException(status_code=400, detail="You cannot demote your own account")
-        eo_db.set_user_role(int(user_id), body["role"])
-        changes["role"] = body["role"]
+        changes["role"] = role = body["role"]
+    dep = target.get("department_id")
     if "department_id" in body:
         dep = body.get("department_id") or None
         if dep and not eo_db.get_department(dep):
             raise HTTPException(status_code=400, detail="Department not found")
-        eo_db.set_user_department(int(user_id), dep)
         changes["department_id"] = dep
-    if body.get("password"):
-        if len(body["password"]) < 8:
+    if role == "dept_user" and not dep:
+        raise HTTPException(status_code=400, detail="A department user needs a department")
+    password = body.get("password") or ""
+    if password:
+        if len(password) < 8:
             raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
-        h, s = eo_auth.hash_password(body["password"])
+    if not changes and not password:
+        return {"ok": True, "user": eo_db.get_user(user_id)}
+
+    if "name" in changes:
+        eo_db.set_user_name(int(user_id), changes["name"])
+    if "active" in changes:
+        eo_db.set_user_active(int(user_id), changes["active"])
+    if "role" in changes:
+        eo_db.set_user_role(int(user_id), changes["role"])
+    if "department_id" in changes:
+        eo_db.set_user_department(int(user_id), changes["department_id"])
+    if password:
+        h, s = eo_auth.hash_password(password)
         eo_db.update_user_password(int(user_id), h, s)
         changes["password"] = "reset"
     audit.log("user_updated", user=admin, target=f"user:{user_id}", detail=changes, request=request)
-    return {"ok": True}
+    return {"ok": True, "user": eo_db.get_user(user_id)}
 
 
 # ---------------------------------------------------------------------------------------
@@ -503,6 +556,25 @@ async def ticket_priority(ticket_id: str, request: Request):
                             "ticket_priority", request, {"priority": pr})
 
 
+@router.post("/tickets/{ticket_id}/update")
+async def ticket_update(ticket_id: str, request: Request):
+    """The ticket page's single Save: any of category / department_id / user_id / priority /
+    status / note in one request, all-or-nothing."""
+    user = eo_auth.require_user(request)
+    body = await _body(request)
+    changes = {k: body[k] for k in tickets.EDIT_KEYS if k in body}
+    for key in ("department_id", "user_id"):
+        if changes.get(key) not in (None, ""):
+            changes[key] = _whole_int(changes[key], key, 1, 10 ** 9)
+    if "note" in changes:
+        changes["note"] = _clean_str(body, "note", max_len=2000)
+    detail = {k: v for k, v in changes.items() if k != "note"}
+    if changes.get("note"):
+        detail["note_chars"] = len(changes["note"])
+    return _run_ticket_edit(user, ticket_id, lambda t: tickets.apply_edit(t, changes, user),
+                            "ticket_updated", request, detail)
+
+
 @router.post("/tickets/{ticket_id}/reclassify")
 async def ticket_reclassify(ticket_id: str, request: Request):
     user = eo_auth.require_admin(request)
@@ -553,6 +625,9 @@ async def summary(request: Request):
     out["tickets"]["recent_escalated"] = [_decorate(t) for t in out["tickets"]["recent_escalated"]]
     if eo_auth.is_admin(user):
         calls = await store.summary({})
+        # Model cost is ours, not the client's: the Subscription page shows minutes and ₹.
+        calls = {k: v for k, v in calls.items() if k not in ("total_cost_usd", "avg_cost_per_call")}
+        calls["by_day"] = [{k: v for k, v in d.items() if k != "cost_usd"} for d in calls.get("by_day") or []]
         out["calls"] = calls
         out["live_calls"] = _active_calls()
         out["gemini_status"] = _gemini_status()
@@ -575,9 +650,97 @@ async def live_token(request: Request):
 
 
 # ---------------------------------------------------------------------------------------
+# Super admin (the service provider): the client's menu, and clearing test data
+# ---------------------------------------------------------------------------------------
+def _superadmin_state() -> dict:
+    hidden, source = client_hidden_pages()
+    return {"pages": list(UI_PAGES), "client_hidden_pages": hidden, "source": source,
+            "counts": data_reset.counts(), "live_calls": len(_active_calls()),
+            "backup_root": data_reset.backup_root()}
+
+
+@router.get("/superadmin")
+async def superadmin_get(request: Request):
+    eo_auth.require_superadmin(request)
+    return JSONResponse(_superadmin_state())
+
+
+@router.put("/superadmin/pages")
+async def superadmin_pages(request: Request):
+    """Which pages the client's admins see. {"hidden_pages": [...]} or {"reset": true} (back to .env)."""
+    user = eo_auth.require_superadmin(request)
+    body = await _body(request)
+    if body.get("reset"):
+        eo_db.delete_setting("hidden_pages")
+        audit.log("client_pages_reset", user=user, request=request)
+    else:
+        raw = body.get("hidden_pages")
+        if not isinstance(raw, list):
+            raise HTTPException(status_code=400, detail="hidden_pages must be a list of page keys")
+        wanted = {str(p).strip().lower() for p in raw}
+        clean = [p for p in UI_PAGES if p in wanted]
+        eo_db.set_setting("hidden_pages", clean, updated_by=user["username"])
+        audit.log("client_pages_updated", user=user, detail={"hidden_pages": clean}, request=request)
+    return JSONResponse(_superadmin_state())
+
+
+@router.post("/superadmin/reset-data")
+async def superadmin_reset_data(request: Request):
+    """Delete test data before go-live (backed up first). Body: {"confirm": "DELETE",
+    "parts": ["tickets", "calls", "audit", "outbound"]}. Refused while a call is on the line."""
+    user = eo_auth.require_superadmin(request)
+    body = await _body(request)
+    if str(body.get("confirm") or "").strip() != "DELETE":
+        raise HTTPException(status_code=400, detail="Type DELETE to confirm")
+    if _active_calls():
+        raise HTTPException(status_code=409, detail="A call is on the line right now. Try again when it has ended.")
+    try:
+        result = await data_reset.reset(body.get("parts"), user)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse(dict(result, state=_superadmin_state()))
+
+
+# ---------------------------------------------------------------------------------------
+# Subscription (the client's plan and usage)
+# ---------------------------------------------------------------------------------------
+@router.get("/subscription")
+async def subscription_get(request: Request):
+    user = eo_auth.require_admin(request)
+    return JSONResponse(subscription.snapshot(user))
+
+
+@router.put("/subscription")
+async def subscription_put(request: Request):
+    """Override the .env plan (service provider only). {"reset": true} goes back to .env."""
+    user = eo_auth.require_superadmin(request)
+    body = await _body(request)
+    if body.get("reset"):
+        eo_db.delete_setting(subscription.SETTING_KEY)
+        audit.log("subscription_reset", user=user, request=request)
+    else:
+        try:
+            clean = subscription.validate(body)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if not clean:
+            raise HTTPException(status_code=400, detail="Nothing to save")
+        eo_db.set_setting(subscription.SETTING_KEY, clean, updated_by=user["username"])
+        audit.log("subscription_updated", user=user, detail=clean, request=request)
+    return JSONResponse(subscription.snapshot(user))
+
+
+# ---------------------------------------------------------------------------------------
 # Call logs (admin)
 # ---------------------------------------------------------------------------------------
+# Model cost and token counts stay on the record for us; the client UI never sees them.
 _CALL_COST_KEYS = {"gemini_cost_usd", "tokens", "gemini_model"}
+
+
+def _strip_cost(call: dict) -> dict:
+    for key in _CALL_COST_KEYS:
+        call.pop(key, None)
+    return call
 
 
 def _call_filters(request: Request) -> dict:
@@ -598,7 +761,9 @@ async def calls_list(request: Request):
         filters["limit"] = 100
     data = await store.list_calls(filters)
     for c in data["items"]:
+        _strip_cost(c)
         c["has_recording"] = store.has_recording(c.get("call_sid"))
+        c.setdefault("caller_name", "")
     return JSONResponse(data)
 
 
@@ -608,10 +773,12 @@ async def call_detail(call_id: str, request: Request):
     call = await store.load_call(call_id)
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
-    call = dict(call)
+    call = _strip_cost(dict(call))
     call.setdefault("messages", call.get("transcript") or [])
     call["has_recording"] = store.has_recording(call.get("call_sid"))
     call["tickets"] = [_decorate(t) for t in eo_db.tickets_by_call(call_id)]
+    if not call.get("caller_name"):
+        call["caller_name"] = next((t.get("caller_name") for t in call["tickets"] if t.get("caller_name")), "")
     audit.log("transcript_viewed", user=user, target=f"call:{call_id}", request=request)
     return JSONResponse(call)
 
@@ -630,10 +797,16 @@ async def call_audio(call_id: str, request: Request):
 # ---------------------------------------------------------------------------------------
 # Agents (admin)
 # ---------------------------------------------------------------------------------------
+def _agent_public(a):
+    """The row plus whether its script is the shipped one (auto-updates on deploy) or customised."""
+    return dict(a, script_state=eo_db.agent_script_state(a))
+
+
 @router.get("/agents")
 async def agents_list(request: Request):
     eo_auth.require_admin(request)
-    return JSONResponse({"items": eo_db.list_agents(), "placeholders": sorted(prompt_render.KNOWN_PLACEHOLDERS)})
+    return JSONResponse({"items": [_agent_public(a) for a in eo_db.list_agents()],
+                         "placeholders": sorted(prompt_render.KNOWN_PLACEHOLDERS)})
 
 
 def _agent_or_404(agent_id):
@@ -646,7 +819,15 @@ def _agent_or_404(agent_id):
 @router.get("/agents/{agent_id}")
 async def agents_detail(agent_id: int, request: Request):
     eo_auth.require_admin(request)
-    return JSONResponse(_agent_or_404(agent_id))
+    return JSONResponse(_agent_public(_agent_or_404(agent_id)))
+
+
+@router.get("/agents/{agent_id}/versions")
+async def agents_versions(agent_id: int, request: Request):
+    """Every script text an auto-update or a reset replaced on this agent, newest first."""
+    eo_auth.require_admin(request)
+    _agent_or_404(agent_id)
+    return JSONResponse({"items": eo_db.list_agent_versions(agent_id)})
 
 
 @router.patch("/agents/{agent_id}")
@@ -682,18 +863,18 @@ async def agents_update(agent_id: int, request: Request):
     eo_db.update_agent(agent_id, **fields)
     _invalidate_call_cache()
     audit.log("agent_updated", user=admin, target=f"agent:{agent_id}", detail=sorted(fields.keys()), request=request)
-    return JSONResponse(eo_db.get_agent(agent_id))
+    return JSONResponse(_agent_public(eo_db.get_agent(agent_id)))
 
 
 @router.post("/agents/{agent_id}/reset")
 async def agents_reset(agent_id: int, request: Request):
     admin = eo_auth.require_admin(request)
     a = _agent_or_404(agent_id)
-    if not eo_db.refresh_seed_agent(a["slug"]):
+    if not eo_db.refresh_seed_agent(a["slug"], by=admin["username"]):
         raise HTTPException(status_code=400, detail="This agent has no shipped template to reset to")
     _invalidate_call_cache()
     audit.log("agent_reset", user=admin, target=f"agent:{agent_id}", request=request)
-    return JSONResponse(eo_db.get_agent(agent_id))
+    return JSONResponse(_agent_public(eo_db.get_agent(agent_id)))
 
 
 @router.post("/agents/{agent_id}/preview")
@@ -750,6 +931,17 @@ _OUTCOME_LABELS = {
 
 def _outcome_label(value):
     return _OUTCOME_LABELS.get(value, (value, "amber"))[0] if value else None
+
+
+def _parse_iso(value):
+    """ISO-8601 -> aware datetime, or None for blank/unparseable (a retry with no due time)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 
 def _contact_display(cc, campaign=None, runner_on=True, now=None, now_min=None):
@@ -972,6 +1164,24 @@ async def campaign_contact_cancel(campaign_id: int, cc_id: int, request: Request
     return {"ok": True}
 
 
+@router.get("/campaigns/{campaign_id}/contacts/{cc_id}/call")
+async def campaign_contact_call(campaign_id: int, cc_id: int, request: Request):
+    """The most recent call record for one recipient — transcript, tool calls, tickets."""
+    admin = eo_auth.require_admin(request)
+    _campaign_or_404(campaign_id)
+    _cc_or_404(campaign_id, cc_id)
+    meta = await store.find_campaign_call(cc_id)
+    call = await store.load_call(meta["id"]) if meta else None
+    if not call:
+        raise HTTPException(status_code=404, detail="No answered call recorded for this recipient yet")
+    call = dict(call)
+    call.setdefault("messages", call.get("transcript") or [])
+    call["has_recording"] = store.has_recording(call.get("call_sid"))
+    call["tickets"] = [_decorate(t) for t in eo_db.tickets_by_call(call["id"])]
+    audit.log("transcript_viewed", user=admin, target=f"call:{call['id']}", request=request)
+    return JSONResponse(call)
+
+
 @router.patch("/campaigns/{campaign_id}/contacts/{cc_id}/remark")
 async def campaign_contact_remark(campaign_id: int, cc_id: int, request: Request):
     eo_auth.require_admin(request)
@@ -1001,7 +1211,7 @@ async def scheduler_toggle(request: Request):
     admin = eo_auth.require_admin(request)
     body = await _body(request)
     enabled = bool(body.get("enabled", not campaign_runner.is_enabled()))
-    campaign_runner.set_override(enabled)
+    campaign_runner.set_override(enabled, by=admin["username"])
     audit.log("scheduler_toggled", user=admin, detail={"enabled": enabled}, request=request)
     return {"ok": True, "enabled": enabled}
 

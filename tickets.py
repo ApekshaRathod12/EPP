@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import audit
 import eo_db
 import languages
 import routing
@@ -45,6 +46,100 @@ _DIGIT_WORDS = {
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
 }
 _SPOKEN_DIGIT = {d: w for w, d in _DIGIT_WORDS.items() if w not in ("oh", "o")}
+
+# Spoken-number vocabulary for a caller reading a reference out loud: English number words,
+# romanised Hindi and Devanagari digits, and "double"/"triple". Values: an int for a number
+# word, or a tag for a multiplier/repeater.
+_ONES = {
+    "zero": 0, "oh": 0, "o": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9,
+    "shunya": 0, "sifar": 0, "ek": 1, "do": 2, "teen": 3, "char": 4, "chaar": 4, "paanch": 5,
+    "panch": 5, "chhe": 6, "che": 6, "saat": 7, "aath": 8, "nau": 9,
+    "शून्य": 0, "जीरो": 0, "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पांच": 5, "पाँच": 5, "छह": 6,
+    "छः": 6, "सात": 7, "आठ": 8, "नौ": 9,
+}
+_TEENS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+          "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "das": 10, "दस": 10}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+         "eighty": 80, "ninety": 90}
+_MULT = {"hundred": 100, "thousand": 1000, "sau": 100, "hazaar": 1000, "hazar": 1000, "सौ": 100, "हज़ार": 1000}
+_REPEAT = {"double": 2, "triple": 3}
+_NUMBER_WORDS = set(_ONES) | set(_TEENS) | set(_TENS) | set(_MULT) | set(_REPEAT)
+
+
+def _words_to_digits(tokens) -> str:
+    """'two thousand twenty six zero zero zero zero one two' -> '2026000012'.
+
+    Consecutive words that legally compose one number ('two thousand twenty six', 'one hundred
+    and twenty three', 'twenty six') are summed into one group; a lone digit word starts a new
+    group ('two zero two six' -> 2 0 2 6); 'double'/'triple' repeat the next digit; plain digit
+    tokens pass through. Groups are concatenated in order."""
+    out = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.isdigit():
+            out.append(tok)
+            i += 1
+            continue
+        if tok in _REPEAT and i + 1 < n and tokens[i + 1] in _ONES:
+            out.append(str(_ONES[tokens[i + 1]]) * _REPEAT[tok])
+            i += 2
+            continue
+        if tok not in _NUMBER_WORDS or tok in _MULT:
+            i += 1                                   # letters, 'and', a stray multiplier
+            continue
+        # Start a numeric phrase and extend it only while the grammar allows.
+        total, current = 0, 0
+        if tok in _ONES:
+            current = _ONES[tok]
+            last = "ones"
+        elif tok in _TEENS:
+            current = _TEENS[tok]
+            last = "teens"
+        else:
+            current = _TENS[tok]
+            last = "tens"
+        i += 1
+        while i < n:
+            nxt = tokens[i]
+            if nxt == "and" and i + 1 < n and tokens[i + 1] in _NUMBER_WORDS and last == "mult":
+                i += 1
+                continue
+            if nxt in _MULT:
+                m = _MULT[nxt]
+                if m == 1000:
+                    total = (total + current) * 1000 if last != "mult" else total * 1000
+                    current = 0
+                else:
+                    current = (current or 1) * m
+                last = "mult"
+                i += 1
+                continue
+            if last == "mult" and nxt in _TENS:
+                total += current
+                current = _TENS[nxt]
+                last = "tens"
+                i += 1
+                continue
+            if last == "mult" and (nxt in _ONES or nxt in _TEENS):
+                total += current
+                current = _ONES.get(nxt, _TEENS.get(nxt))
+                last = "ones" if nxt in _ONES else "teens"
+                i += 1
+                # a ones word after a multiplier closes the phrase unless another multiplier follows
+                if not (i < n and tokens[i] in _MULT):
+                    break
+                continue
+            if last == "tens" and nxt in _ONES and _ONES[nxt] != 0:
+                current += _ONES[nxt]
+                last = "ones"
+                i += 1
+                break
+            break                                    # anything else starts a new group
+        out.append(str(total + current))
+    return "".join(out)
 
 
 class TicketError(ValueError):
@@ -97,12 +192,14 @@ def normalize_ticket_number(text, now=None):
     s = str(text or "").strip().lower()
     if not s:
         return None
-    # spoken digits -> digits (English only; the model usually hands us digits anyway)
-    words = re.findall(r"[a-z]+|\d+", s)
-    if words and any(w in _DIGIT_WORDS for w in words):
-        s = " ".join(_DIGIT_WORDS.get(w, w) for w in words)
-        s = re.sub(r"(?<=\d) (?=\d)", "", s)
-    groups = re.findall(r"\d+", s)
+    # Spoken numbers ("two thousand twenty six … zero zero twelve", Hindi digit words) become
+    # one digit string; a number given as digits keeps its own grouping.
+    tokens = re.findall(r"[a-z]+|\d+|[ऀ-ॿ]+", s)
+    if any(t in _NUMBER_WORDS for t in tokens):
+        digits_str = _words_to_digits(tokens)
+        groups = [digits_str] if digits_str else []
+    else:
+        groups = re.findall(r"\d+", s)
     if not groups:
         return None
     year_now = (now or datetime.now(_IST)).year
@@ -125,6 +222,9 @@ def normalize_ticket_number(text, now=None):
 
 
 def _clean_phone(raw, fallback=""):
+    """E.164 for anything an Indian caller or operator types: "98765 43210", "098765 43210",
+    "+91 98765 43210", "91 98765 43210", or a full +CC number. Fewer than 10 digits is not a
+    phone number and comes back as "" so a slip never turns into a dial attempt."""
     digits = re.sub(r"\D", "", str(raw or ""))
     if not digits:
         digits = re.sub(r"\D", "", str(fallback or ""))
@@ -132,10 +232,12 @@ def _clean_phone(raw, fallback=""):
         return ""
     if len(digits) == 10:
         return "+91" + digits
+    if len(digits) == 11 and digits.startswith("0"):
+        return "+91" + digits[1:]                    # domestic trunk-prefix form
     if len(digits) == 12 and digits.startswith("91"):
         return "+" + digits
-    if str(raw or fallback or "").strip().startswith("+"):
-        return "+" + digits
+    if len(digits) < 10:
+        return ""
     return "+" + digits
 
 
@@ -173,6 +275,10 @@ def create_from_tool(args: dict, call_meta: dict | None = None) -> dict:
         if len(description) < 5:
             return {"ok": False, "error": "description is empty",
                     "instruction": "You have not captured the concern yet. Ask the caller to explain it, then call create_ticket again."}
+        if not _s(args.get("caller_name"), 120):
+            return {"ok": False, "error": "caller_name is empty",
+                    "instruction": "You do not have the caller's name. Ask for it once more, politely. If they "
+                                   "decline, call create_ticket again with caller_name set to 'Not given'."}
 
         categories = eo_db.list_categories(active_only=True)
         cat = routing.resolve_category(caller_type, args.get("category"), categories)
@@ -219,6 +325,13 @@ def create_from_tool(args: dict, call_meta: dict | None = None) -> dict:
                                    note=f"routed by category '{category_name}'")
         logger.info("TICKET %s created: %s/%s prio=%s dept=%s call=%s",
                     ticket_id, caller_type, category_name, priority, dept_name, call_meta.get("call_id"))
+        # The audit log answers "was a ticket created on this call?" without a join to
+        # ticket_events, so the agent's registrations are recorded there too.
+        audit.log("ticket_created", user=audit.AGENT, target=f"ticket:{ticket_id}",
+                  detail={"phone": _clean_phone(args.get("contact_number"), call_meta.get("caller")),
+                          "caller_type": caller_type, "category": category_name, "priority": priority,
+                          "call_id": call_meta.get("call_id") or "",
+                          "source": "campaign" if campaign_id else (call_meta.get("source") or "voice")})
         return {
             "ok": True,
             "ticket_id": ticket_id,
@@ -235,6 +348,65 @@ def create_from_tool(args: dict, call_meta: dict | None = None) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}",
                 "instruction": "The ticket could not be registered because of a technical problem. Apologise, "
                                "ask the caller to call again in a few minutes, and do NOT invent a number."}
+
+
+_UPDATABLE = ("caller_name", "contact_number", "company_name", "vendor_code", "employee_id",
+              "caller_department", "plant_location")
+
+
+def update_from_tool(args: dict, call_meta: dict | None, created_ids) -> dict:
+    """update_ticket tool handler: correct or extend a ticket registered on THIS call.
+
+    `created_ids` are the ticket ids the recorder saw create_ticket return on this call — the
+    only tickets the agent may touch. Never raises."""
+    args = args or {}
+    created_ids = set(created_ids or [])
+    try:
+        tid = normalize_ticket_number(args.get("ticket_id"))
+        if not tid or tid not in created_ids:
+            return {"ok": False, "error": "not a ticket from this call",
+                    "instruction": "You can only correct a ticket you registered on this call. If the caller "
+                                   "wants to change an older ticket, note it as a new concern instead."}
+        ticket = eo_db.get_ticket(tid)
+        if not ticket:
+            return {"ok": False, "error": "ticket not found",
+                    "instruction": "That ticket could not be found. Continue without changing it."}
+        fields, changed, summary = {}, [], []
+        for key in _UPDATABLE:
+            val = _s(args.get(key), 200)
+            if not val:
+                continue
+            if key == "contact_number":
+                val = _clean_phone(val)
+            if val == (ticket.get(key) or ""):
+                continue
+            fields[key] = val
+            changed.append(key)
+            summary.append(f"{key} is now {val}")
+            eo_db.add_ticket_event(tid, "corrected", actor_type="ai", actor_name="Helpline agent",
+                                   from_value=ticket.get(key) or "", to_value=val,
+                                   note=f"{key.replace('_', ' ')} corrected on the call")
+        addition = _s(args.get("additional_details"), 2000)
+        if addition:
+            fields["description"] = (ticket.get("description") or "").rstrip() + "\n\nAdded later on the call: " + addition
+            changed.append("additional_details")
+            summary.append("the concern now includes the additional details")
+            eo_db.add_ticket_event(tid, "note", actor_type="ai", actor_name="Helpline agent",
+                                   note="Added on the call: " + addition)
+        if not changed:
+            return {"ok": False, "error": "nothing to change",
+                    "instruction": "Nothing was changed — the values you passed are blank or already on the "
+                                   "ticket. Continue the call."}
+        eo_db.update_ticket(tid, **fields)
+        logger.info("TICKET %s updated on call %s: %s", tid, (call_meta or {}).get("call_id"), ", ".join(changed))
+        return {"ok": True, "ticket_id": tid, "changed": changed,
+                "instruction": "SYSTEM NOTE — updated: " + "; ".join(summary) + ". Confirm ONCE in one short "
+                               "sentence in the caller's language, then continue. Do not read the reference "
+                               "number again unless they ask."}
+    except Exception as e:
+        logger.exception("update_ticket failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}",
+                "instruction": "The correction could not be saved. Apologise briefly and continue."}
 
 
 def lookup(ticket_number) -> dict:
@@ -274,9 +446,8 @@ def _actor(user):
             "actor_name": user.get("name") or user.get("username") or ""}
 
 
-def change_status(ticket: dict, new_status: str, user=None, note="") -> dict:
-    new_status = str(new_status or "").strip().lower()
-    cur = ticket.get("status") or "open"
+def _validate_transition(cur: str, new_status: str, user=None) -> None:
+    """Raise TicketError unless `cur` → `new_status` is a move this user may make."""
     if new_status not in STATUSES:
         raise TicketError(f"Unknown status '{new_status}'")
     if new_status == cur:
@@ -285,6 +456,12 @@ def change_status(ticket: dict, new_status: str, user=None, note="") -> dict:
         raise TicketError(f"Cannot move a ticket from {STATUS_LABEL[cur]} to {STATUS_LABEL[new_status]}")
     if (cur, new_status) in _REOPEN and (user or {}).get("role") != "admin":
         raise TicketError("Only an admin can reopen a resolved or closed ticket")
+
+
+def change_status(ticket: dict, new_status: str, user=None, note="") -> dict:
+    new_status = str(new_status or "").strip().lower()
+    cur = ticket.get("status") or "open"
+    _validate_transition(cur, new_status, user)
     fields = {"status": new_status}
     now = _now_iso()
     if new_status == "resolved":
@@ -386,6 +563,94 @@ def reclassify(ticket: dict, category_name: str, user=None, note="") -> dict:
                                to_value=cat.get("department_name") or "",
                                note=f"re-routed by category '{cat['name']}'", **_actor(user))
     return eo_db.get_ticket(ticket["ticket_id"])
+
+
+EDIT_KEYS = ("category", "department_id", "user_id", "priority", "status", "note")
+_UNSET = object()
+
+
+def apply_edit(ticket: dict, changes: dict, user=None) -> dict:
+    """One Save from the ticket page: category, department, assignee, priority, status and a
+    note in a single request. EVERYTHING is validated before anything is written, so a bad
+    field means no change at all. Each applied field writes the same ticket_events as the
+    single-field routes; the note rides on the status change when there is one, otherwise on
+    the last applied change, otherwise it becomes a note of its own. Raises TicketError."""
+    changes = {k: v for k, v in (changes or {}).items() if k in EDIT_KEYS}
+    is_admin = (user or {}).get("role") == "admin"
+    note = str(changes.get("note") or "").strip()
+    if len(note) > 2000:
+        raise TicketError("Note is too long (max 2000 characters)")
+
+    # --- validate
+    cat_name = None
+    if changes.get("category") not in (None, ""):
+        if not is_admin:
+            raise TicketError("Only an admin can change the category")
+        wanted = str(changes["category"]).strip()
+        cat = routing.resolve_category(ticket.get("caller_type"), wanted, eo_db.list_categories(active_only=True))
+        if not cat or (cat["name"] == "Other" and wanted.lower() != "other"):
+            raise TicketError("Category not found for this caller type")
+        if cat["name"] != (ticket.get("category") or ""):
+            cat_name = cat["name"]
+    dep = _UNSET
+    if "department_id" in changes:
+        d = changes["department_id"]
+        if d in (None, ""):
+            dep = ""
+        else:
+            if not is_admin:
+                raise TicketError("Only an admin can move a ticket to another department")
+            if not eo_db.get_department(d):
+                raise TicketError("Department not found")
+            dep = int(d)
+        if (dep or None) == ticket.get("assigned_department_id"):
+            dep = _UNSET
+    uid = _UNSET
+    if "user_id" in changes:
+        u = changes["user_id"]
+        if u in (None, ""):
+            uid = ""
+        else:
+            if not eo_db.get_user(int(u)):
+                raise TicketError("User not found")
+            uid = int(u)
+        if (uid or None) == ticket.get("assigned_user_id"):
+            uid = _UNSET
+    priority = None
+    if changes.get("priority") not in (None, ""):
+        p = str(changes["priority"]).strip().lower()
+        if p not in eo_db.PRIORITIES:
+            raise TicketError("Priority must be high, medium or low")
+        if p != (ticket.get("priority") or "medium"):
+            priority = p
+    status = None
+    if changes.get("status") not in (None, ""):
+        s = str(changes["status"]).strip().lower()
+        cur = ticket.get("status") or "open"
+        if s != cur:
+            _validate_transition(cur, s, user)
+            status = s
+    assigning = dep is not _UNSET or uid is not _UNSET
+    steps = [k for k, on in (("category", cat_name), ("assign", assigning), ("priority", priority),
+                             ("status", status)) if on]
+    if not steps and not note:
+        raise TicketError("Nothing to save")
+    note_on = "status" if status else (steps[-1] if steps else "note")
+
+    # --- apply, in a fixed order, each step reading the ticket the previous one left
+    t = ticket
+    if cat_name:
+        t = reclassify(t, cat_name, user, note if note_on == "category" else "")
+    if assigning:
+        t = assign(t, department_id=(None if dep is _UNSET else dep), user_id=(None if uid is _UNSET else uid),
+                   user=user, note=note if note_on == "assign" else "")
+    if priority:
+        t = set_priority(t, priority, user, note if note_on == "priority" else "")
+    if status:
+        t = change_status(t, status, user, note if note_on == "status" else "")
+    if note_on == "note":
+        t = add_note(t, note, user)
+    return t
 
 
 # ---------------------------------------------------------------------------------------
@@ -508,7 +773,8 @@ async def post_call(call_id: str):
                         "subcategory": result.get("subcategory") or "",
                         "high_priority_reason": (result.get("escalation_flags") or ["none"])[0],
                     },
-                    {"call_id": call.get("id"), "call_sid": call.get("call_sid"), "caller": call.get("caller")},
+                    {"call_id": call.get("id"), "call_sid": call.get("call_sid"), "caller": call.get("caller"),
+                     "source": "post_call"},
                 )
                 if res.get("ok"):
                     eo_db.update_ticket(res["ticket_id"], source="post_call")

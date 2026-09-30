@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { api, downloadFile, fmtDate, qs, STATUS_LABEL, CALLER_TYPES, LANG_NAME, cap } from '../api.js'
 import { useAuth } from '../auth.jsx'
+import { refreshingStyle, useDebounced } from '../hooks.js'
+import InlineLoader from '../components/Loading.jsx'
 import PageHeader from '../components/PageHeader.jsx'
 import { IconDownload, IconSearch } from '../components/icons.jsx'
 import { PriorityPill, StatusPill, TypePill } from '../components/Pills.jsx'
@@ -10,6 +12,7 @@ const PAGE = 25
 
 export default function Tickets() {
   const { isAdmin } = useAuth()
+  const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(0)
@@ -32,7 +35,9 @@ export default function Tickets() {
 
   useEffect(() => { if (isAdmin) api.get('/departments').then((d) => setDepts(d.items || [])).catch(() => {}) }, [isAdmin])
 
-  const query = useMemo(() => qs({ ...f, limit: PAGE, offset: page * PAGE }), [params, page]) // eslint-disable-line react-hooks/exhaustive-deps
+  // The typed text updates the URL at once; the fetch waits for a pause in typing.
+  const dq = useDebounced(f.q, 300)
+  const query = useMemo(() => qs({ ...f, q: dq, limit: PAGE, offset: page * PAGE }), [params, dq, page]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     let cancel = false
@@ -66,7 +71,7 @@ export default function Tickets() {
         </div>
         <select value={f.status} onChange={(e) => set('status', e.target.value)}>
           <option value="">All statuses</option>
-          <option value="open,under_review,escalated">Open (any)</option>
+          <option value="open,under_review,escalated">Unresolved (open, under review, escalated)</option>
           {Object.entries(STATUS_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
         </select>
         <select value={f.priority} onChange={(e) => set('priority', e.target.value)}>
@@ -89,12 +94,13 @@ export default function Tickets() {
         <input type="date" value={f.from} onChange={(e) => set('from', e.target.value)} title="From" />
         <input type="date" value={f.to} onChange={(e) => set('to', e.target.value)} title="To" />
         <button className="btn ghost sm" onClick={() => { setParams({}, { replace: true }); setPage(0) }}>Reset</button>
+        <InlineLoader show={loading} label="Searching…" />
       </div>
 
       {err && <div className="err">{err}</div>}
 
-      <div className="table-wrap">
-        <table>
+      <div className="table-wrap tall" style={refreshingStyle(loading)}>
+        <table className="cards">
           <thead>
             <tr>
               {th('ticket_id', 'Ticket')}
@@ -110,20 +116,21 @@ export default function Tickets() {
             </tr>
           </thead>
           <tbody>
-            {loading ? <tr><td colSpan={10} className="empty">Loading…</td></tr>
+            {loading && !items.length ? <tr><td colSpan={10} className="empty">Loading…</td></tr>
               : !items.length ? <tr><td colSpan={10} className="empty">No tickets match.</td></tr>
               : items.map((t) => (
-                <tr key={t.ticket_id} className="clickable" onClick={() => {}}>
-                  <td><Link to={`/tickets/${t.ticket_id}`} style={{ fontFamily: 'var(--mono)', fontWeight: 600, color: 'var(--green-2)' }}>{t.ticket_id}</Link></td>
-                  <td>{fmtDate(t.created_at)}</td>
-                  <td><TypePill type={t.caller_type} /></td>
-                  <td>{t.caller_name || <span className="muted">—</span>}<div className="muted" style={{ fontSize: '0.72rem' }}>{t.contact_number}</div></td>
-                  <td>{t.category}{t.subcategory && <div className="muted" style={{ fontSize: '0.72rem' }}>{t.subcategory}</div>}</td>
-                  <td>{t.assigned_department || <span className="muted">Unassigned</span>}</td>
-                  <td><PriorityPill priority={t.priority} escalated={t.escalation_flag} /></td>
-                  <td><StatusPill status={t.status} /></td>
-                  <td>{LANG_NAME[t.language] || t.language || '—'}</td>
-                  <td className="muted" style={{ maxWidth: 320, fontSize: '0.78rem' }} title={t.ai_summary || t.description}>
+                <tr key={t.ticket_id} className="clickable" title="Open this ticket"
+                    onClick={() => navigate(`/tickets/${t.ticket_id}`)}>
+                  <td data-label="Ticket" onClick={(e) => e.stopPropagation()}><Link to={`/tickets/${t.ticket_id}`} style={{ fontFamily: 'var(--mono)', fontWeight: 600, color: 'var(--green-2)' }}>{t.ticket_id}</Link></td>
+                  <td data-label="Registered">{fmtDate(t.created_at)}</td>
+                  <td data-label="Type"><TypePill type={t.caller_type} /></td>
+                  <td data-label="Caller">{t.caller_name || <span className="muted">—</span>}<div className="muted" style={{ fontSize: '0.72rem' }}>{t.contact_number}</div></td>
+                  <td data-label="Category">{t.category}{t.subcategory && <div className="muted" style={{ fontSize: '0.72rem' }}>{t.subcategory}</div>}</td>
+                  <td data-label="Department">{t.assigned_department || <span className="muted">Unassigned</span>}</td>
+                  <td data-label="Priority"><PriorityPill priority={t.priority} escalated={t.escalation_flag} /></td>
+                  <td data-label="Status"><StatusPill status={t.status} /></td>
+                  <td data-label="Language">{LANG_NAME[t.language] || t.language || '—'}</td>
+                  <td data-label="Summary" className="muted" style={{ maxWidth: 320, fontSize: '0.78rem' }} title={t.ai_summary || t.description}>
                     {(t.ai_summary || t.description || '').slice(0, 110)}{(t.ai_summary || t.description || '').length > 110 ? '…' : ''}
                   </td>
                 </tr>

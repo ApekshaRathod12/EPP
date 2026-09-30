@@ -1,21 +1,26 @@
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth.jsx'
 import {
   IconDashboard, IconTicket, IconRouting, IconAgent, IconLogs, IconUsers, IconAudit, IconUser, IconLogout,
-  IconContacts, IconCampaigns, IconClock,
+  IconContacts, IconCampaigns, IconClock, IconAlert,
 } from './icons.jsx'
 
-const ADMIN_NAV = [
+// `page` is the key the super admin (or EPP_HIDDEN_PAGES) uses to take an entry off the
+// client's menu. `superOnly` entries exist only for the service provider's accounts.
+export const ADMIN_NAV = [
   { to: '/', label: 'Dashboard', icon: IconDashboard, end: true },
   { to: '/tickets', label: 'Tickets', icon: IconTicket },
-  { to: '/campaigns', label: 'Campaigns', icon: IconCampaigns },
-  { to: '/contacts', label: 'Contacts', icon: IconContacts },
-  { to: '/scheduler', label: 'Scheduler', icon: IconClock },
-  { to: '/routing', label: 'Routing', icon: IconRouting },
-  { to: '/agents', label: 'Agent', icon: IconAgent },
-  { to: '/call-logs', label: 'Call Logs', icon: IconLogs },
-  { to: '/users', label: 'Users', icon: IconUsers },
-  { to: '/audit', label: 'Audit Log', icon: IconAudit },
+  { to: '/campaigns', label: 'Campaigns', icon: IconCampaigns, page: 'campaigns' },
+  { to: '/contacts', label: 'Contacts', icon: IconContacts, page: 'contacts' },
+  { to: '/scheduler', label: 'Scheduler', icon: IconClock, page: 'scheduler' },
+  { to: '/routing', label: 'Departments & Routing', icon: IconRouting, page: 'routing' },
+  { to: '/agents', label: 'Agent', icon: IconAgent, page: 'agents' },
+  { to: '/call-logs', label: 'Call Logs', icon: IconLogs, page: 'call-logs' },
+  { to: '/users', label: 'Users', icon: IconUsers, page: 'users' },
+  { to: '/audit', label: 'Audit Log', icon: IconAudit, page: 'audit' },
+  { to: '/subscription', label: 'Subscription', icon: IconClock, page: 'subscription' },
+  { to: '/superadmin', label: 'Super admin', icon: IconAlert, superOnly: true },
 ]
 
 const DEPT_NAV = [
@@ -31,9 +36,13 @@ function initials(name, username) {
 }
 
 export default function Layout() {
-  const { user, isAdmin, logout } = useAuth()
+  const { user, isAdmin, logout, isHidden, isSuperadmin, clientHidden } = useAuth()
   const navigate = useNavigate()
-  const nav = isAdmin ? ADMIN_NAV : DEPT_NAV
+  const location = useLocation()
+  const [open, setOpen] = useState(false)          // the drawer on small screens
+  const nav = (isAdmin ? ADMIN_NAV : DEPT_NAV).filter((n) => !isHidden(n.page) && (!n.superOnly || isSuperadmin))
+
+  useEffect(() => { setOpen(false) }, [location.pathname])   // navigating closes the drawer
 
   function doLogout() {
     logout()
@@ -42,7 +51,8 @@ export default function Layout() {
 
   return (
     <div className="shell">
-      <aside className="sidebar">
+      {open && <div className="drawer-backdrop" onClick={() => setOpen(false)} />}
+      <aside className={`sidebar${open ? ' open' : ''}`}>
         <div className="brand">
           <div className="logo">EPP</div>
           <div>
@@ -52,9 +62,10 @@ export default function Layout() {
         </div>
         <nav className="nav">
           {nav.map((n) => (
-            <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => (isActive ? 'active' : '')}>
+            <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => (isActive ? 'active' : '')} onClick={() => setOpen(false)}>
               <n.icon />
               <span>{n.label}</span>
+              {isSuperadmin && n.page && clientHidden.has(n.page) && <span className="nav-tag" title="The client's admins do not see this page">hidden</span>}
             </NavLink>
           ))}
         </nav>
@@ -67,6 +78,7 @@ export default function Layout() {
 
       <div className="main">
         <header className="topbar">
+          <button className="menu-btn" aria-label="Menu" onClick={() => setOpen((o) => !o)}>☰</button>
           <div id="topbar-title" />
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginLeft: 'auto' }}>
             <NavLink to="/profile" className="userchip" title="My profile">

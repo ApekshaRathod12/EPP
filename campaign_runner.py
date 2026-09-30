@@ -34,10 +34,6 @@ logger = logging.getLogger(__name__)
 # Outcomes meaning "no live person gave us an answer" — retried like a ring-out.
 _UNANSWERED_OUTCOMES = frozenset({"callback", "not_reachable"})
 
-# In-memory admin override (None = follow env). Set via the admin toggle endpoint.
-_enabled_override = None
-
-
 def _cfg_int(name, default):
     """EPP_* first, the legacy EO_* spelling second, then the default."""
     for key in (name, name.replace("EPP_", "EO_", 1)):
@@ -54,15 +50,25 @@ def _max_active_campaigns():
     return campaigns.max_active()
 
 
-def set_override(value):
-    """True/False to force on/off, None to follow the env var."""
-    global _enabled_override
-    _enabled_override = value
+def set_override(value, by=""):
+    """True/False to force on/off, None to follow the env var. Persisted in the settings table:
+    the admin's kill switch must survive a restart or a redeploy."""
+    try:
+        if value is None:
+            eo_db.delete_setting("scheduler_enabled")
+        else:
+            eo_db.set_setting("scheduler_enabled", bool(value), updated_by=by)
+    except Exception:
+        logger.exception("could not persist the scheduler switch")
 
 
 def is_enabled():
-    if _enabled_override is not None:
-        return _enabled_override
+    try:
+        stored = eo_db.get_setting("scheduler_enabled")
+    except Exception:
+        stored = None
+    if stored is not None:
+        return bool(stored)
     raw = os.getenv("EPP_CAMPAIGN_RUNNER_ENABLED", os.getenv("EO_CAMPAIGN_RUNNER_ENABLED", "true"))
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
@@ -129,15 +135,21 @@ async def _reap_calling(campaign, now):
             if not rec.get("ended_at"):
                 continue                     # still on the call
             outcome = rec.get("outcome")
-            if not outcome:
-                # No record_outcome: a created ticket is the answer; otherwise the person
-                # answered and the agent never recorded how it ended.
-                outcome = "ticket_created" if rec.get("ticket_id") else "answered"
+            if rec.get("ticket_id"):
+                # A ticket registered on the call is the truth, even if the agent also recorded
+                # "no_concern" (seen live: it did both). Never let bookkeeping hide a ticket.
+                outcome = "ticket_created"
+            elif not outcome:
+                # No record_outcome and no ticket: the person answered and the agent never
+                # recorded how it ended.
+                outcome = "answered"
             if outcome in _UNANSWERED_OUTCOMES:
                 eo_db.cc_update(cc["id"], outcome=outcome, last_call_id=rec.get("id"))
                 _apply_failure(cc, campaign, now, error=outcome)
             else:
                 fields = dict(call_status="done", outcome=outcome, last_call_id=rec.get("id"))
+                if rec.get("ticket_id") and not cc.get("ticket_id"):
+                    fields["ticket_id"] = rec["ticket_id"]      # link the row to what the call produced
                 note = (rec.get("outcome_note") or "").strip()
                 if note and not (cc.get("remark") or "").strip():
                     fields["remark"] = note          # never over a human edit

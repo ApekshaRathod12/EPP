@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, qs, fmtDate, cap, CALLER_TYPES } from '../api.js'
+import { refreshingStyle, useDebounced } from '../hooks.js'
+import InlineLoader from './Loading.jsx'
 import { IconSearch } from './icons.jsx'
 
 const PAGE = 25
@@ -15,7 +17,8 @@ export default function ContactsTable({ selectable, selected, onToggle, onToggle
   const [type, setType] = useState('')
   const [page, setPage] = useState(0)
 
-  const filters = useMemo(() => ({ q, caller_type: type, limit: PAGE, offset: page * PAGE }), [q, type, page])
+  const dq = useDebounced(q, 300)
+  const filters = useMemo(() => ({ q: dq, caller_type: type, limit: PAGE, offset: page * PAGE }), [dq, type, page])
 
   useEffect(() => {
     let cancel = false
@@ -35,6 +38,7 @@ export default function ContactsTable({ selectable, selected, onToggle, onToggle
       <div className="toolbar">
         <div className="search"><span className="ic"><IconSearch /></span>
           <input placeholder="Search name / phone / notes…" value={q} onChange={(e) => { setPage(0); setQ(e.target.value) }} /></div>
+        <InlineLoader show={loading} label="Searching…" />
         <select value={type} onChange={(e) => { setPage(0); setType(e.target.value) }}>
           <option value="">All types</option>
           {CALLER_TYPES.map((t) => <option key={t} value={t}>{cap(t)}</option>)}
@@ -42,7 +46,7 @@ export default function ContactsTable({ selectable, selected, onToggle, onToggle
         {actions}
       </div>
       {err && <div className="err">{err}</div>}
-      <div className="table-wrap">
+      <div className="table-wrap tall" style={refreshingStyle(loading)}>
         <table>
           <thead><tr>
             {selectable && <th className="no-sort" style={{ width: 34 }}>
@@ -51,7 +55,7 @@ export default function ContactsTable({ selectable, selected, onToggle, onToggle
             <th className="no-sort">Notes</th><th className="no-sort">Status</th><th className="no-sort">Added</th>
           </tr></thead>
           <tbody>
-            {loading ? <tr><td colSpan={7} className="empty">Loading…</td></tr>
+            {loading && !items.length ? <tr><td colSpan={7} className="empty">Loading…</td></tr>
               : !items.length ? <tr><td colSpan={7} className="empty">No contacts yet. Upload a sheet or add one.</td></tr>
               : items.map((c) => (
                 <tr key={c.id} className={selectable ? 'clickable' : ''} onClick={selectable ? () => onToggle?.(c.id) : undefined}>
