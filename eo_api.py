@@ -770,7 +770,7 @@ def _contact_display(cc, campaign=None, runner_on=True, now=None, now_min=None):
     if int(cc.get("attempts") or 0) == 0:
         return ("Queued", "amber")
     reason = _outcome_label(outcome) or (cc.get("last_error") or "no answer")
-    nxt = _parse_iso(cc.get("next_attempt_at"))
+    nxt = campaigns._parse_iso(cc.get("next_attempt_at"))
     if nxt and nxt > (now or datetime.now(timezone.utc)):
         return (f"Retry scheduled — {reason}", "amber")
     if campaign and campaign.get("status") != "live":
