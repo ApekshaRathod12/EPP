@@ -107,15 +107,15 @@ def placeholders(profile):
     else:
         lines.append("- Open tickets: none")
     lines.append(
-        "RULES: Your opening greets them by first name and asks if it is them. If they confirm, do NOT "
-        "ask again for the details above — confirm them in ONE short breath (\"I have you as an "
+        "RULES: Your opening greets them warmly by first name (\"Oh hi {first_name}… is that you?\") and waits for their answer. "
+        "If they confirm it is them, do NOT ask again for the details above — confirm briefly and naturally (\"Great, I have you as a "
         f"{profile.get('caller_type') or 'caller'}"
         + (f" at {profile['details']['plant_location']}" if profile["details"].get("plant_location") else "")
-        + " — still correct?\") and go straight to their concern. If they have open tickets, offer to tell "
+        + " — still correct?\") and go straight to their concern. If they have open tickets, warmly offer to tell "
         "them where one stands or to register something new. For the status, call lookup_ticket yourself "
         "with the ticket number listed above (ask which one only if there are several) — never make them "
         "recite a number you already hold — and say ONLY what the tool returns. "
-        "If it is NOT them (a different person on this number), say \"no problem\" and treat them as a new "
+        "If it is NOT them (a different person on this number), say \"no problem, no worries\" and treat them as a new "
         "caller from CALLER TYPE onwards: never read out the other person's name, details or tickets."
     )
     return {

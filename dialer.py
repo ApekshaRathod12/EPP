@@ -11,6 +11,8 @@ import logging
 import os
 from urllib.parse import quote
 
+import phone_utils
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,13 @@ async def place_call(to_number, *, base_url=None, request=None, agent_id=None,
     script and tools for this one recipient."""
     if not to_number:
         return {"error": "Missing 'to' number"}
+
+    # Normalize phone number: accept with or without +91 prefix
+    normalized = phone_utils.normalize_phone(to_number)
+    if not normalized:
+        return {"error": f"Invalid phone number format: {to_number}"}
+    to_number = normalized
+
     base = _base_url(base_url=base_url, request=request)
     if not base:
         return {"error": "No PUBLIC_URL configured; cannot build answer_url"}

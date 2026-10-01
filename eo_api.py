@@ -306,6 +306,12 @@ async def departments_update(department_id: int, request: Request):
         if other and other["id"] != department_id:
             raise HTTPException(status_code=409, detail="That code is already used")
         fields["code"] = code
+    if "email" in body:
+        email = _clean_str(body, "email", max_len=200, required=False)
+        # Validate email format if provided
+        if email and "@" not in email:
+            raise HTTPException(status_code=400, detail="Invalid email address")
+        fields["email"] = email if email else None
     if "active" in body:
         fields["active"] = 1 if body["active"] else 0
     if "sort_order" in body:
@@ -532,9 +538,16 @@ async def ticket_assign(ticket_id: str, request: Request):
     if uid is not None and uid != "":
         uid = _whole_int(uid, "user_id", 1, 10 ** 9)
     note = _clean_str(body, "note", max_len=2000)
-    return _run_ticket_edit(user, ticket_id,
+
+    # Get ticket before assignment to check if department changed
+    t = _ticket_or_404(user, ticket_id)
+    old_dep_id = t.get("assigned_department_id")
+
+    result = _run_ticket_edit(user, ticket_id,
                             lambda t: tickets.assign(t, department_id=dep, user_id=uid, user=user, note=note),
                             "ticket_assigned", request, {"department_id": dep, "user_id": uid})
+
+    return result
 
 
 @router.post("/tickets/{ticket_id}/note")

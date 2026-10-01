@@ -54,6 +54,7 @@ import eo_auth
 import eo_db
 import known_caller
 import languages
+import phone_utils
 import prompt_render
 import store
 import tickets
@@ -443,12 +444,43 @@ async def websocket_endpoint(websocket: WebSocket):
     text_input_queue = asyncio.Queue()
     client_disconnected = False
 
+    audio_buffer = []
+    buffer_lock = asyncio.Lock()
+    buffer_flush_task = None
+    min_buffer_size = 4096
+
+    async def flush_audio_buffer():
+        nonlocal buffer_flush_task
+        await asyncio.sleep(0.35)
+        async with buffer_lock:
+            if audio_buffer and not client_disconnected:
+                try:
+                    combined = b''.join(audio_buffer)
+                    await websocket.send_bytes(combined)
+                except Exception:
+                    pass
+                audio_buffer.clear()
+        buffer_flush_task = None
+
     async def audio_output_callback(data):
+        nonlocal buffer_flush_task
         if not client_disconnected:
-            try:
-                await websocket.send_bytes(data)
-            except Exception:
-                pass
+            async with buffer_lock:
+                audio_buffer.append(data)
+                total_size = sum(len(chunk) for chunk in audio_buffer)
+
+                if total_size >= min_buffer_size:
+                    if buffer_flush_task:
+                        buffer_flush_task.cancel()
+                        buffer_flush_task = None
+                    combined = b''.join(audio_buffer)
+                    try:
+                        asyncio.create_task(websocket.send_bytes(combined))
+                    except Exception:
+                        pass
+                    audio_buffer.clear()
+                elif buffer_flush_task is None:
+                    buffer_flush_task = asyncio.create_task(flush_audio_buffer())
 
     async def audio_interrupt_callback():
         pass
@@ -624,10 +656,14 @@ async def plivo_answer(request: Request):
             logger.warning("/plivo/answer: could not read the form body (%s)", e)
     # ?caller= exists only on answer URLs WE built for outbound dials (a test call, or a
     # campaign dial carrying ?campaign=&cc=); a genuine inbound call carries the number in `From`.
-    # Plivo's From arrives as "919876543210" (no plus); store and speak it as E.164 like every
-    # other number in the system, so call records and the known-caller match line up.
-    raw_from = qp.get("From") or qp.get("from") or ""
-    caller = qp.get("caller") or (tickets._clean_phone(raw_from) or raw_from)
+    caller = qp.get("caller") or qp.get("From") or qp.get("from") or ""
+    # Normalize phone number: accept with or without +91 prefix
+    if caller:
+        normalized = phone_utils.normalize_phone(caller)
+        if normalized:
+            caller = normalized
+        else:
+            logger.warning(f"Could not normalize caller phone: {caller}")
     call_uuid = qp.get("CallUUID") or qp.get("callUUID") or qp.get("RequestUUID") or ""
     campaign_id = cc_id = None
     try:
