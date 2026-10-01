@@ -54,8 +54,8 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --d
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
 sudo apt-get update && sudo apt-get install -y caddy git
 
-# The code. Two mirrors carry the same main: GitHub (used by the server) and Bitbucket.
-git clone https://github.com/addiskers/epp.git ~/epp && cd ~/epp
+# The code
+git clone https://github.com/ApekshaRathod12/EPP.git ~/epp && cd ~/epp
 
 # Settings
 cp .env.example .env
